@@ -324,6 +324,89 @@ _Optional, Default: `false`_
 The `forwardExtraLDAPHeaders` option determines if the LDAP Extra Headers, `Ldap-Extra-Attr-DN` and
 `Ldap-Extra-Attr-CN`, will be added or not to request. This is not used if the `forwardUsername` option is set to `false` or if `searchFilter` is empty.
 
+> All headers this middleware can forward (`forwardUsernameHeader`, `Ldap-Extra-Attr-*`, user info and groups headers below)
+> are removed from every incoming request first, so a client cannot spoof them.
+
+##### `forwardUserInfo`
+
+_Optional, Default: `false`_
+
+Forward the user's email, first name and last name read from LDAP. Requires Search Mode (`searchFilter`). The values are read once at login and stored in the session cookie. Empty attributes are not forwarded.
+Values are sent as raw UTF-8.
+
+##### `forwardEmailHeader`, `forwardFirstNameHeader`, `forwardLastNameHeader`
+
+_Optional, Default: `Remote-User-Email`, `Remote-User-First-Name`, `Remote-User-Last-Name`_
+
+Header names used by `forwardUserInfo`. The defaults match the NetBox defaults (`REMOTE_AUTH_USER_EMAIL`, `REMOTE_AUTH_USER_FIRST_NAME`, `REMOTE_AUTH_USER_LAST_NAME`).
+
+##### `emailAttribute`, `firstNameAttribute`, `lastNameAttribute`
+
+_Optional, Default: `mail`, `givenName`, `sn`_
+
+LDAP attributes used by `forwardUserInfo`.
+
+##### `forwardGroups`
+
+_Optional, Default: `false`_
+
+Forward the names (first RDN value, usually `CN`) of the groups the user is member of, joined by `forwardGroupsSeparator`. Resolved once at login and stored in the session cookie. If the groups cannot be resolved, the login is rejected (fail closed), because an empty list could strip the user's permissions in the backend.
+
+Keep the list small with `forwardGroupsFilter`: the session cookie is limited to 4096 bytes. If it is exceeded, the request is still served but the session is not cached and every request queries LDAP.
+
+##### `forwardGroupsHeader`
+
+_Optional, Default: `Remote-User-Group`_
+
+Header name for `forwardGroups`. The default matches NetBox `REMOTE_AUTH_GROUP_HEADER` (`HTTP_REMOTE_USER_GROUP`).
+
+##### `forwardGroupsSeparator`
+
+_Optional, Default: `|`_
+
+Separator for `forwardGroups`. The default matches NetBox `REMOTE_AUTH_GROUP_SEPARATOR`.
+
+##### `forwardGroupsNested`
+
+_Optional, Default: `false`_
+
+If `false`, groups are read from the user's `memberOf` attribute (direct membership only, Search Mode required).
+If `true`, groups are searched with `(&(objectClass=group)(member:1.2.840.113556.1.4.1941:=<userDN>))` (Active Directory only), which includes nested groups. This costs one extra LDAP search per login.
+
+##### `forwardGroupsBaseDn`
+
+_Optional, Default: value of `baseDN`_
+
+Base DN for the nested groups search (`forwardGroupsNested: true`).
+
+##### `forwardGroupsFilter`
+
+_Optional, Default: `""`_
+
+Regular expression ([Go syntax](https://pkg.go.dev/regexp/syntax)) matched against the group name. Only matching groups are forwarded. Example: `^NetBox_`.
+
+##### `forwardHeaderEncoding`
+
+_Optional, Default: `""`_
+
+Encoding of forwarded header values. `""` sends raw UTF-8. `rfc2047` sends values containing non-ASCII characters
+as RFC 2047 encoded-words (`Matěj` -> `=?UTF-8?B?TWF0xJtq?=`); pure ASCII values are not changed.
+Applies to the username, `Ldap-Extra-Attr-*`, user info and groups headers. Groups are encoded one by one, so the
+backend can still split on `forwardGroupsSeparator`.
+
+Use it when the backend drops non-ASCII header values (e.g. Granian, the app server of netbox-docker, turns them into
+empty strings). The backend has to decode the values, e.g. in Python with `email.header.decode_header`.
+Without encoding, a warning is logged at login when a forwarded value contains non-ASCII characters.
+
+```yaml
+forwardUserInfo: true
+forwardHeaderEncoding: rfc2047
+forwardGroups: true
+forwardGroupsNested: true
+forwardGroupsBaseDn: DC=example,DC=local
+forwardGroupsFilter: "^NetBox_"
+```
+
 ##### `wwwAuthenticateHeader`
 
 _Optional, Default: `true`_

@@ -11,11 +11,13 @@ import (
 	"fmt"
 	"io/ioutil"
 	"log"
+	"mime"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"reflect"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -80,7 +82,24 @@ type Config struct {
 	EnableNestedGroupFilter    bool               `json:"enableNestedGroupsFilter,omitempty" yaml:"enableNestedGroupsFilter,omitempty"`
 	AllowedGroups              []string           `json:"allowedGroups,omitempty" yaml:"allowedGroups,omitempty"`
 	AllowedUsers               []string           `json:"allowedUsers,omitempty" yaml:"allowedUsers,omitempty"`
-	Username                   string
+	// Forward user details (email, first name, last name) read from LDAP. Search Mode only.
+	ForwardUserInfo        bool   `json:"forwardUserInfo,omitempty" yaml:"forwardUserInfo,omitempty"`
+	ForwardEmailHeader     string `json:"forwardEmailHeader,omitempty" yaml:"forwardEmailHeader,omitempty"`
+	ForwardFirstNameHeader string `json:"forwardFirstNameHeader,omitempty" yaml:"forwardFirstNameHeader,omitempty"`
+	ForwardLastNameHeader  string `json:"forwardLastNameHeader,omitempty" yaml:"forwardLastNameHeader,omitempty"`
+	EmailAttribute         string `json:"emailAttribute,omitempty" yaml:"emailAttribute,omitempty"`
+	FirstNameAttribute     string `json:"firstNameAttribute,omitempty" yaml:"firstNameAttribute,omitempty"`
+	LastNameAttribute      string `json:"lastNameAttribute,omitempty" yaml:"lastNameAttribute,omitempty"`
+	// Forward the names (CN) of the groups the user is member of.
+	ForwardGroups          bool   `json:"forwardGroups,omitempty" yaml:"forwardGroups,omitempty"`
+	ForwardGroupsHeader    string `json:"forwardGroupsHeader,omitempty" yaml:"forwardGroupsHeader,omitempty"`
+	ForwardGroupsSeparator string `json:"forwardGroupsSeparator,omitempty" yaml:"forwardGroupsSeparator,omitempty"`
+	ForwardGroupsNested    bool   `json:"forwardGroupsNested,omitempty" yaml:"forwardGroupsNested,omitempty"`
+	ForwardGroupsBaseDN    string `json:"forwardGroupsBaseDn,omitempty" yaml:"forwardGroupsBaseDn,omitempty"`
+	ForwardGroupsFilter    string `json:"forwardGroupsFilter,omitempty" yaml:"forwardGroupsFilter,omitempty"`
+	// Encoding of forwarded header values: "" (raw) or "rfc2047" (=?UTF-8?B?...?= for non-ASCII values).
+	ForwardHeaderEncoding string `json:"forwardHeaderEncoding,omitempty" yaml:"forwardHeaderEncoding,omitempty"`
+	Username              string
 	// params below are deprecated use 'ServerList' instead
 	URL                  string `json:"url,omitempty" yaml:"url,omitempty"`
 	Port                 uint16 `json:"port,omitempty" yaml:"port,omitempty"`
@@ -120,6 +139,20 @@ func CreateConfig() *Config {
 		EnableNestedGroupFilter:    false,
 		AllowedGroups:              nil,
 		AllowedUsers:               nil,
+		ForwardUserInfo:            false,
+		ForwardEmailHeader:         "Remote-User-Email",
+		ForwardFirstNameHeader:     "Remote-User-First-Name",
+		ForwardLastNameHeader:      "Remote-User-Last-Name",
+		EmailAttribute:             "mail",
+		FirstNameAttribute:         "givenName",
+		LastNameAttribute:          "sn",
+		ForwardGroups:              false,
+		ForwardGroupsHeader:        "Remote-User-Group",
+		ForwardGroupsSeparator:     "|",
+		ForwardGroupsNested:        false,
+		ForwardGroupsBaseDN:        "",
+		ForwardGroupsFilter:        "",
+		ForwardHeaderEncoding:      "",
 		Username:                   "",
 		// deprecated use 'ServerList' instead
 		URL: "",
@@ -128,9 +161,10 @@ func CreateConfig() *Config {
 
 // LdapAuth Struct plugin.
 type LdapAuth struct {
-	next   http.Handler
-	name   string
-	config *Config
+	next        http.Handler
+	name        string
+	config      *Config
+	groupsRegex *regexp.Regexp
 }
 
 // New created a new LdapAuth plugin.
@@ -202,11 +236,188 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 	// 30 days.
 	store.MaxAge(store.Options.MaxAge)
 
+	var groupsRegex *regexp.Regexp
+	if config.ForwardGroups && config.ForwardGroupsFilter != "" {
+		var err error
+		groupsRegex, err = regexp.Compile(config.ForwardGroupsFilter)
+		if err != nil {
+			return nil, fmt.Errorf("invalid forwardGroupsFilter '%s': %w", config.ForwardGroupsFilter, err)
+		}
+	}
+
+	switch config.ForwardHeaderEncoding {
+	case "", HeaderEncodingRFC2047:
+	default:
+		return nil, fmt.Errorf("invalid forwardHeaderEncoding '%s': supported values are '' and '%s'", config.ForwardHeaderEncoding, HeaderEncodingRFC2047)
+	}
+
+	if config.ForwardUserInfo && config.SearchFilter == "" {
+		LoggerWARNING.Printf("forwardUserInfo requires Search Mode (searchFilter), user info will not be forwarded")
+	}
+	if config.ForwardGroups && !config.ForwardGroupsNested && config.SearchFilter == "" {
+		LoggerWARNING.Printf("forwardGroups without forwardGroupsNested requires Search Mode (searchFilter), groups will be empty")
+	}
+
 	return &LdapAuth{
-		name:   name,
-		next:   next,
-		config: config,
+		name:        name,
+		next:        next,
+		config:      config,
+		groupsRegex: groupsRegex,
 	}, nil
+}
+
+// forwardedHeaders returns the headers this middleware sets towards the backend.
+// They are removed from every incoming request so a client cannot spoof them.
+func forwardedHeaders(config *Config) []string {
+	// Ldap-Extra-Attr-* belong to this plugin, strip them even when not forwarded.
+	headers := []string{"Ldap-Extra-Attr-DN", "Ldap-Extra-Attr-CN"}
+	if config.ForwardUsername {
+		headers = append(headers, config.ForwardUsernameHeader)
+	}
+	if config.ForwardUserInfo {
+		headers = append(headers, config.ForwardEmailHeader, config.ForwardFirstNameHeader, config.ForwardLastNameHeader)
+	}
+	if config.ForwardGroups {
+		headers = append(headers, config.ForwardGroupsHeader)
+	}
+	return headers
+}
+
+// userInfoAttributes returns the LDAP attributes requested for user info and groups.
+func userInfoAttributes(config *Config) []string {
+	attrs := []string{"dn", "cn"}
+	if config.ForwardUserInfo {
+		attrs = append(attrs, config.EmailAttribute, config.FirstNameAttribute, config.LastNameAttribute)
+	}
+	if config.ForwardGroups && !config.ForwardGroupsNested {
+		attrs = append(attrs, "memberOf")
+	}
+	return attrs
+}
+
+// LdapGetUserGroups returns the CN of the groups the user is member of, filtered by groupsRegex.
+// Direct membership is read from memberOf; with ForwardGroupsNested the groups are searched
+// using LDAP_MATCHING_RULE_IN_CHAIN (Active Directory), which includes nested groups.
+func LdapGetUserGroups(conn *ldap.Conn, config *Config, entry *ldap.Entry, groupsRegex *regexp.Regexp) ([]string, error) {
+	var groupDNs []string
+
+	if config.ForwardGroupsNested {
+		baseDN := config.ForwardGroupsBaseDN
+		if baseDN == "" {
+			baseDN = config.BaseDN
+		}
+		filter := fmt.Sprintf("(&(objectClass=group)(member:1.2.840.113556.1.4.1941:=%s))", ldap.EscapeFilter(entry.DN))
+		LoggerDEBUG.Printf("Groups Search: base '%s' filter '%s'", baseDN, filter)
+
+		search := ldap.NewSearchRequest(
+			baseDN,
+			ldap.ScopeWholeSubtree,
+			ldap.NeverDerefAliases,
+			0,
+			0,
+			false,
+			filter,
+			[]string{"dn"},
+			nil,
+		)
+		result, err := conn.Search(search)
+		if err != nil {
+			return nil, fmt.Errorf("groups search failed: %w", err)
+		}
+		for _, e := range result.Entries {
+			groupDNs = append(groupDNs, e.DN)
+		}
+	} else {
+		groupDNs = entry.GetAttributeValues("memberOf")
+	}
+
+	return GroupNamesFromDNs(groupDNs, groupsRegex), nil
+}
+
+// GroupNamesFromDNs extracts the first RDN value (CN) of each group DN,
+// applies the optional filter, removes duplicates and sorts the result.
+func GroupNamesFromDNs(dns []string, groupsRegex *regexp.Regexp) []string {
+	seen := map[string]bool{}
+	names := []string{}
+
+	for _, dn := range dns {
+		name := dn
+		if parsed, err := ldap.ParseDN(dn); err == nil && len(parsed.RDNs) > 0 && len(parsed.RDNs[0].Attributes) > 0 {
+			name = parsed.RDNs[0].Attributes[0].Value
+		} else {
+			LoggerWARNING.Printf("could not parse group DN '%s', using it as is", dn)
+		}
+
+		if name == "" || seen[name] {
+			continue
+		}
+		if groupsRegex != nil && !groupsRegex.MatchString(name) {
+			continue
+		}
+		seen[name] = true
+		names = append(names, name)
+	}
+
+	sort.Strings(names)
+	return names
+}
+
+// HeaderEncodingRFC2047 encodes non-ASCII header values as RFC 2047 encoded-words (=?UTF-8?B?...?=).
+const HeaderEncodingRFC2047 = "rfc2047"
+
+// isASCII reports whether s contains only 7-bit characters.
+func isASCII(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] > 0x7f {
+			return false
+		}
+	}
+	return true
+}
+
+// encodeHeaderValue encodes v for use as an HTTP header value according to encoding.
+// Pure ASCII values are never changed. Many backends (e.g. Granian, used by netbox-docker)
+// drop header values containing non-ASCII bytes, so raw UTF-8 should be avoided.
+func encodeHeaderValue(v, encoding string) string {
+	if encoding == HeaderEncodingRFC2047 && !isASCII(v) {
+		return mime.BEncoding.Encode("UTF-8", v)
+	}
+	return v
+}
+
+// encodeGroupsValue encodes each group separately, so the backend can still split on separator.
+func encodeGroupsValue(v, separator, encoding string) string {
+	if encoding == "" || separator == "" || isASCII(v) {
+		return v
+	}
+	groups := strings.Split(v, separator)
+	for i, g := range groups {
+		groups[i] = encodeHeaderValue(g, encoding)
+	}
+	return strings.Join(groups, separator)
+}
+
+// warnNonASCII logs values that a backend may drop because they are sent as raw UTF-8.
+func warnNonASCII(config *Config, values map[string]string) {
+	if config.ForwardHeaderEncoding != "" {
+		return
+	}
+	for name, v := range values {
+		if !isASCII(v) {
+			LoggerWARNING.Printf("forwarded %s contains non-ASCII characters and is sent as raw UTF-8; "+
+				"some backends drop such headers, consider forwardHeaderEncoding: %s", name, HeaderEncodingRFC2047)
+		}
+	}
+}
+
+// setHeaderFromSession sets header to the session value stored under key, if not empty.
+func setHeaderFromSession(req *http.Request, session *sessions.Session, header, key, encoding string) {
+	if header == "" {
+		return
+	}
+	if v, ok := session.Values[key].(string); ok && v != "" {
+		req.Header.Set(header, encodeHeaderValue(v, encoding))
+	}
 }
 
 func (la *LdapAuth) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
@@ -217,6 +428,11 @@ func (la *LdapAuth) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	}
 
 	var err error
+
+	// Never trust identity headers sent by the client.
+	for _, h := range forwardedHeaders(la.config) {
+		req.Header.Del(h)
+	}
 
 	session, _ := store.Get(req, la.config.CacheCookieName)
 	LoggerDEBUG.Printf("Session details: %v", session)
@@ -293,6 +509,38 @@ func (la *LdapAuth) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 
 	defer conn.Close()
 
+	if la.config.ForwardGroups {
+		groups, err := LdapGetUserGroups(conn, la.config, entry, la.groupsRegex)
+		if err != nil {
+			// Fail closed: forwarding an empty group list could silently strip permissions in the backend.
+			LoggerERROR.Printf("%s", err)
+			RequireAuth(rw, req, la.config, err)
+			return
+		}
+		LoggerDEBUG.Printf("User: '%s' forwarded groups: %v", entry.DN, groups)
+		session.Values["ldap-groups"] = strings.Join(groups, la.config.ForwardGroupsSeparator)
+	}
+
+	if la.config.ForwardUserInfo {
+		session.Values["ldap-email"] = entry.GetAttributeValue(la.config.EmailAttribute)
+		session.Values["ldap-firstname"] = entry.GetAttributeValue(la.config.FirstNameAttribute)
+		session.Values["ldap-lastname"] = entry.GetAttributeValue(la.config.LastNameAttribute)
+	}
+
+	toWarn := map[string]string{"username": username}
+	if la.config.ForwardExtraLdapHeaders {
+		toWarn["Ldap-Extra-Attr-CN"] = entry.GetAttributeValue("cn")
+	}
+	if la.config.ForwardUserInfo {
+		toWarn["first name"], _ = session.Values["ldap-firstname"].(string)
+		toWarn["last name"], _ = session.Values["ldap-lastname"].(string)
+		toWarn["email"], _ = session.Values["ldap-email"].(string)
+	}
+	if la.config.ForwardGroups {
+		toWarn["groups"], _ = session.Values["ldap-groups"].(string)
+	}
+	warnNonASCII(la.config, toWarn)
+
 	LoggerINFO.Printf("Authentication succeeded")
 
 	// Set user as authenticated.
@@ -300,24 +548,41 @@ func (la *LdapAuth) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	session.Values["ldap-dn"] = entry.DN
 	session.Values["ldap-cn"] = entry.GetAttributeValue("cn")
 	session.Values["authenticated"] = true
-	session.Save(req, rw)
+	if err := session.Save(req, rw); err != nil {
+		// e.g. cookie larger than 4096 bytes (too many groups): request is served, but not cached.
+		LoggerWARNING.Printf("could not save session cookie: %s", err)
+	}
 
 	ServeAuthenicated(la, session, rw, req)
 }
 
 func ServeAuthenicated(la *LdapAuth, session *sessions.Session, rw http.ResponseWriter, req *http.Request) {
+	enc := la.config.ForwardHeaderEncoding
+
 	// Sanitize Some Headers Infos.
 	if la.config.ForwardUsername {
 		username := session.Values["username"].(string)
 
 		req.URL.User = url.User(username)
-		req.Header[la.config.ForwardUsernameHeader] = []string{username}
+		req.Header[la.config.ForwardUsernameHeader] = []string{encodeHeaderValue(username, enc)}
 
 		if la.config.ForwardExtraLdapHeaders && la.config.SearchFilter != "" {
-			userDN := session.Values["ldap-dn"].(string)
-			userCN := session.Values["ldap-cn"].(string)
-			req.Header["Ldap-Extra-Attr-DN"] = []string{userDN}
-			req.Header["Ldap-Extra-Attr-CN"] = []string{userCN}
+			userDN, _ := session.Values["ldap-dn"].(string)
+			userCN, _ := session.Values["ldap-cn"].(string)
+			req.Header["Ldap-Extra-Attr-DN"] = []string{encodeHeaderValue(userDN, enc)}
+			req.Header["Ldap-Extra-Attr-CN"] = []string{encodeHeaderValue(userCN, enc)}
+		}
+	}
+
+	if la.config.ForwardUserInfo {
+		setHeaderFromSession(req, session, la.config.ForwardEmailHeader, "ldap-email", enc)
+		setHeaderFromSession(req, session, la.config.ForwardFirstNameHeader, "ldap-firstname", enc)
+		setHeaderFromSession(req, session, la.config.ForwardLastNameHeader, "ldap-lastname", enc)
+	}
+
+	if la.config.ForwardGroups {
+		if v, ok := session.Values["ldap-groups"].(string); ok && v != "" && la.config.ForwardGroupsHeader != "" {
+			req.Header.Set(la.config.ForwardGroupsHeader, encodeGroupsValue(v, la.config.ForwardGroupsSeparator, enc))
 		}
 	}
 
@@ -590,7 +855,7 @@ func SearchMode(conn *ldap.Conn, config *Config) (*ldap.SearchResult, error) {
 		0,
 		false,
 		parsedSearchFilter,
-		[]string{"dn", "cn"},
+		userInfoAttributes(config),
 		nil,
 	)
 

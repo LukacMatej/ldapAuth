@@ -338,7 +338,7 @@ Values are sent as raw UTF-8.
 
 _Optional, Default: `Remote-User-Email`, `Remote-User-First-Name`, `Remote-User-Last-Name`_
 
-Header names used by `forwardUserInfo`. The defaults match the NetBox defaults (`REMOTE_AUTH_USER_EMAIL`, `REMOTE_AUTH_USER_FIRST_NAME`, `REMOTE_AUTH_USER_LAST_NAME`).
+Header names used by `forwardUserInfo`.
 
 ##### `emailAttribute`, `firstNameAttribute`, `lastNameAttribute`
 
@@ -358,13 +358,13 @@ Keep the list small with `forwardGroupsFilter`: the session cookie is limited to
 
 _Optional, Default: `Remote-User-Group`_
 
-Header name for `forwardGroups`. The default matches NetBox `REMOTE_AUTH_GROUP_HEADER` (`HTTP_REMOTE_USER_GROUP`).
+Header name for `forwardGroups`. 
 
 ##### `forwardGroupsSeparator`
 
 _Optional, Default: `|`_
 
-Separator for `forwardGroups`. The default matches NetBox `REMOTE_AUTH_GROUP_SEPARATOR`.
+Separator for `forwardGroups`. 
 
 ##### `forwardGroupsNested`
 
@@ -383,7 +383,7 @@ Base DN for the nested groups search (`forwardGroupsNested: true`).
 
 _Optional, Default: `""`_
 
-Regular expression ([Go syntax](https://pkg.go.dev/regexp/syntax)) matched against the group name. Only matching groups are forwarded. Example: `^NetBox_`.
+Regular expression ([Go syntax](https://pkg.go.dev/regexp/syntax)) matched against the group name. Only matching groups are forwarded. Example: `^Admins_`.
 
 ##### `forwardHeaderEncoding`
 
@@ -394,7 +394,7 @@ as RFC 2047 encoded-words (`Matěj` -> `=?UTF-8?B?TWF0xJtq?=`); pure ASCII value
 Applies to the username, `Ldap-Extra-Attr-*`, user info and groups headers. Groups are encoded one by one, so the
 backend can still split on `forwardGroupsSeparator`.
 
-Use it when the backend drops non-ASCII header values (e.g. Granian, the app server of netbox-docker, turns them into
+Use it when the backend drops non-ASCII header values (e.g. Granian, turns them into
 empty strings). The backend has to decode the values, e.g. in Python with `email.header.decode_header`.
 Without encoding, a warning is logged at login when a forwarded value contains non-ASCII characters.
 
@@ -404,7 +404,7 @@ forwardHeaderEncoding: rfc2047
 forwardGroups: true
 forwardGroupsNested: true
 forwardGroupsBaseDn: DC=example,DC=local
-forwardGroupsFilter: "^NetBox_"
+forwardGroupsFilter: "^Admins_"
 ```
 
 ##### `wwwAuthenticateHeader`
